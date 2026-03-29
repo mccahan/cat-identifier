@@ -2,15 +2,19 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install dependencies (including PyTorch for retraining)
+# Install PyTorch CPU version first
+RUN pip install --no-cache-dir \
+    torch \
+    torchvision \
+    --index-url https://download.pytorch.org/whl/cpu
+
+# Install other dependencies from PyPI
 RUN pip install --no-cache-dir \
     flask \
     requests \
     onnxruntime \
     pillow \
-    numpy \
-    torch \
-    torchvision --index-url https://download.pytorch.org/whl/cpu
+    numpy
 
 # Copy application
 COPY app.py .
