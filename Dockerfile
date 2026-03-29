@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir \
     flask \
     requests \
     onnxruntime \
+    onnx \
     pillow \
     numpy
 
