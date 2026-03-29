@@ -23,14 +23,19 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # seconds
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 MODEL_PATH = Path(os.getenv("MODEL_PATH", "/app/models/cat_classifier.onnx"))
 LABELS_PATH = Path(os.getenv("LABELS_PATH", "/app/models/cat_classifier_labels.txt"))
+TRAINING_DIR = Path(os.getenv("TRAINING_DIR", "/training"))
+MODELS_DIR = Path(os.getenv("MODELS_DIR", "/models"))
+RETRAIN_THRESHOLD = int(os.getenv("RETRAIN_THRESHOLD", "10"))  # corrections before suggesting retrain
 
 # Initialize Flask app
 app = Flask(__name__, static_folder='static')
 
 # Global state
 db_lock = threading.Lock()
+model_lock = threading.Lock()
 model_session = None
 labels = []
+is_training = False
 
 def init_db():
     """Initialize SQLite database"""
@@ -73,19 +78,24 @@ def load_model():
     """Load ONNX model and labels"""
     global model_session, labels
     
-    if MODEL_PATH.exists():
-        model_session = ort.InferenceSession(str(MODEL_PATH))
-        print(f"Loaded model from {MODEL_PATH}")
-    else:
-        print(f"Warning: Model not found at {MODEL_PATH}")
-        return
+    # Check for model in MODELS_DIR first (for hot-reload after training)
+    model_path = MODELS_DIR / "cat_classifier.onnx" if (MODELS_DIR / "cat_classifier.onnx").exists() else MODEL_PATH
     
-    if LABELS_PATH.exists():
-        labels = LABELS_PATH.read_text().strip().split('\n')
-        print(f"Loaded labels: {labels}")
-    else:
-        labels = ["hawthorne", "roxie", "sadie"]
-        print(f"Using default labels: {labels}")
+    with model_lock:
+        if model_path.exists():
+            model_session = ort.InferenceSession(str(model_path))
+            print(f"Loaded model from {model_path}")
+        else:
+            print(f"Warning: Model not found at {model_path}")
+            return
+        
+        labels_path = MODELS_DIR / "cat_classifier_labels.txt" if (MODELS_DIR / "cat_classifier_labels.txt").exists() else LABELS_PATH
+        if labels_path.exists():
+            labels = labels_path.read_text().strip().split('\n')
+            print(f"Loaded labels: {labels}")
+        else:
+            labels = ["hawthorne", "roxie", "sadie"]
+            print(f"Using default labels: {labels}")
 
 def preprocess_image(image_bytes):
     """Preprocess image for model inference"""
@@ -286,6 +296,20 @@ def get_thumbnail(sighting_id):
         return send_file(BytesIO(row[0]), mimetype='image/jpeg')
     return "Not found", 404
 
+def save_training_image(thumbnail_bytes, label, sighting_id):
+    """Save a corrected image to the training directory"""
+    training_path = TRAINING_DIR / "corrections" / label
+    training_path.mkdir(parents=True, exist_ok=True)
+    
+    filename = f"{sighting_id}_{int(time.time())}.jpg"
+    filepath = training_path / filename
+    
+    with open(filepath, 'wb') as f:
+        f.write(thumbnail_bytes)
+    
+    print(f"Saved training image: {filepath}")
+    return str(filepath)
+
 @app.route('/api/feedback', methods=['POST'])
 def submit_feedback():
     """Submit correction feedback"""
@@ -303,8 +327,8 @@ def submit_feedback():
         conn = get_db()
         c = conn.cursor()
         
-        # Get original prediction
-        c.execute("SELECT cat_name FROM sightings WHERE id = ?", (sighting_id,))
+        # Get original prediction and thumbnail
+        c.execute("SELECT cat_name, thumbnail FROM sightings WHERE id = ?", (sighting_id,))
         row = c.fetchone()
         
         if not row:
@@ -312,6 +336,7 @@ def submit_feedback():
             return jsonify({"error": "Sighting not found"}), 404
         
         original = row[0]
+        thumbnail = row[1]
         
         # Store feedback
         c.execute('''
@@ -325,10 +350,30 @@ def submit_feedback():
             WHERE id = ?
         ''', (correct_label, sighting_id))
         
+        # Get total corrections count
+        c.execute("SELECT COUNT(*) FROM feedback")
+        total_corrections = c.fetchone()[0]
+        
         conn.commit()
         conn.close()
     
-    return jsonify({"success": True, "original": original, "corrected": correct_label})
+    # Save the image to training directory
+    if thumbnail:
+        save_training_image(thumbnail, correct_label, sighting_id)
+    
+    response = {
+        "success": True, 
+        "original": original, 
+        "corrected": correct_label,
+        "total_corrections": total_corrections
+    }
+    
+    # Suggest retraining if threshold reached
+    if total_corrections >= RETRAIN_THRESHOLD and total_corrections % RETRAIN_THRESHOLD == 0:
+        response["retrain_suggested"] = True
+        response["message"] = f"You've made {total_corrections} corrections. Consider retraining the model!"
+    
+    return jsonify(response)
 
 @app.route('/api/stats')
 def get_stats():
@@ -372,6 +417,149 @@ def trigger_poll():
     """Manually trigger a poll"""
     threading.Thread(target=poll_frigate, daemon=True).start()
     return jsonify({"success": True, "message": "Poll triggered"})
+
+@app.route('/api/retrain/status')
+def retrain_status():
+    """Get retraining status and correction counts"""
+    with db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        
+        # Count corrections per cat
+        c.execute('''
+            SELECT correct_label, COUNT(*) 
+            FROM feedback 
+            GROUP BY correct_label
+        ''')
+        corrections_by_cat = {row[0]: row[1] for row in c.fetchall()}
+        
+        # Count original training images
+        original_counts = {}
+        if TRAINING_DIR.exists():
+            for label in labels:
+                original_path = TRAINING_DIR / "original" / label
+                if original_path.exists():
+                    original_counts[label] = len(list(original_path.glob("*.jpg")))
+                corrections_path = TRAINING_DIR / "corrections" / label
+                if corrections_path.exists():
+                    corrections_by_cat[label] = corrections_by_cat.get(label, 0)
+        
+        c.execute("SELECT COUNT(*) FROM feedback")
+        total_corrections = c.fetchone()[0]
+        
+        conn.close()
+    
+    return jsonify({
+        "is_training": is_training,
+        "total_corrections": total_corrections,
+        "corrections_by_cat": corrections_by_cat,
+        "original_counts": original_counts,
+        "retrain_threshold": RETRAIN_THRESHOLD,
+        "can_retrain": total_corrections > 0 and not is_training
+    })
+
+@app.route('/api/retrain', methods=['POST'])
+def trigger_retrain():
+    """Trigger model retraining"""
+    global is_training
+    
+    if is_training:
+        return jsonify({"error": "Training already in progress"}), 409
+    
+    # Check if we have corrections
+    with db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM feedback")
+        corrections = c.fetchone()[0]
+        conn.close()
+    
+    if corrections == 0:
+        return jsonify({"error": "No corrections to train on"}), 400
+    
+    # Start training in background
+    is_training = True
+    threading.Thread(target=run_training, daemon=True).start()
+    
+    return jsonify({
+        "success": True, 
+        "message": f"Training started with {corrections} corrections",
+        "status_url": "/api/retrain/status"
+    })
+
+def run_training():
+    """Run the training process"""
+    global is_training
+    
+    try:
+        print("Starting model retraining...")
+        
+        # Ensure directories exist
+        TRAINING_DIR.mkdir(parents=True, exist_ok=True)
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Export all sightings with current labels as training data
+        export_training_data()
+        
+        # Run the training script
+        import subprocess
+        result = subprocess.run(
+            ["python3", "/app/train.py"],
+            capture_output=True,
+            text=True,
+            timeout=600  # 10 minute timeout
+        )
+        
+        if result.returncode == 0:
+            print("Training completed successfully!")
+            print(result.stdout)
+            
+            # Reload the model
+            load_model()
+            print("Model reloaded")
+        else:
+            print(f"Training failed: {result.stderr}")
+            
+    except Exception as e:
+        print(f"Training error: {e}")
+    finally:
+        is_training = False
+
+def export_training_data():
+    """Export current sightings as training data"""
+    print("Exporting training data...")
+    
+    with db_lock:
+        conn = get_db()
+        c = conn.cursor()
+        
+        # Get all sightings with their current labels
+        c.execute('''
+            SELECT id, cat_name, thumbnail 
+            FROM sightings 
+            WHERE thumbnail IS NOT NULL
+        ''')
+        
+        for row in c.fetchall():
+            sighting_id, label, thumbnail = row
+            if thumbnail and label in labels:
+                training_path = TRAINING_DIR / "current" / label
+                training_path.mkdir(parents=True, exist_ok=True)
+                
+                filepath = training_path / f"{sighting_id}.jpg"
+                if not filepath.exists():
+                    with open(filepath, 'wb') as f:
+                        f.write(thumbnail)
+        
+        conn.close()
+    
+    print("Training data exported")
+
+@app.route('/api/model/reload', methods=['POST'])
+def reload_model():
+    """Hot-reload the model without restarting"""
+    load_model()
+    return jsonify({"success": True, "message": "Model reloaded"})
 
 if __name__ == '__main__':
     print("Initializing Cat Identifier...")
