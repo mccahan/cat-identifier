@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cat Tracker Widget</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: transparent;
+            color: #e5e7eb;
+            padding: 8px 12px;
+        }
+        
+        .cats {
+            display: flex;
+            gap: 16px;
+            justify-content: space-around;
+        }
+        
+        .cat {
+            text-align: center;
+            flex: 1;
+        }
+        
+        .cat-name {
+            font-weight: 600;
+            font-size: 0.85rem;
+            text-transform: capitalize;
+            margin-bottom: 4px;
+        }
+        
+        .cat-time {
+            font-size: 0.75rem;
+            color: #9ca3af;
+        }
+        
+        .cat-time.recent { color: #4ade80; }
+        .cat-time.moderate { color: #facc15; }
+        .cat-time.old { color: #f87171; }
+        .cat-time.unknown { color: #6b7280; }
+        
+        .cat-thumb {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            object-fit: cover;
+            margin-bottom: 4px;
+            border: 2px solid #374151;
+        }
+        
+        .cat-thumb.hawthorne { border-color: #333; }
+        .cat-thumb.roxie { border-color: #8B4513; }
+        .cat-thumb.sadie { border-color: #e5e7eb; }
+        
+        .no-thumb {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            background: #374151;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.2rem;
+            margin: 0 auto 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="cats" id="cats">
+        <div class="cat">
+            <div class="no-thumb">🐱</div>
+            <div class="cat-name">Loading...</div>
+        </div>
+    </div>
+    
+    <script>
+        function timeAgo(timestamp) {
+            if (!timestamp) return 'Not seen';
+            const seconds = Math.floor(Date.now() / 1000 - timestamp);
+            
+            if (seconds < 60) return 'Just now';
+            if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+            if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+            return `${Math.floor(seconds / 86400)}d ago`;
+        }
+        
+        function getTimeClass(timestamp) {
+            if (!timestamp) return 'unknown';
+            const hours = (Date.now() / 1000 - timestamp) / 3600;
+            if (hours < 2) return 'recent';
+            if (hours < 12) return 'moderate';
+            return 'old';
+        }
+        
+        async function loadData() {
+            try {
+                const resp = await fetch('/api/cats');
+                const data = await resp.json();
+                
+                const container = document.getElementById('cats');
+                container.innerHTML = '';
+                
+                const order = ['hawthorne', 'roxie', 'sadie'];
+                
+                for (const cat of order) {
+                    const info = data[cat];
+                    const div = document.createElement('div');
+                    div.className = 'cat';
+                    
+                    if (info && info.sighting_id) {
+                        div.innerHTML = `
+                            <img class="cat-thumb ${cat}" src="/api/sighting/${info.sighting_id}/thumbnail" alt="${cat}">
+                            <div class="cat-name">${cat}</div>
+                            <div class="cat-time ${getTimeClass(info.last_seen)}">${timeAgo(info.last_seen)}</div>
+                        `;
+                    } else {
+                        div.innerHTML = `
+                            <div class="no-thumb">❓</div>
+                            <div class="cat-name">${cat}</div>
+                            <div class="cat-time unknown">Not seen</div>
+                        `;
+                    }
+                    
+                    container.appendChild(div);
+                }
+            } catch (e) {
+                console.error('Error loading cat data:', e);
+            }
+        }
+        
+        loadData();
+        setInterval(loadData, 60000);
+    </script>
+</body>
+</html>
