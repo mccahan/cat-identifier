@@ -218,6 +218,10 @@ def polling_loop():
 def index():
     return send_from_directory('static', 'index.html')
 
+@app.route('/widget.html')
+def widget():
+    return send_from_directory('static', 'widget.html')
+
 @app.route('/api/cats')
 def get_cats():
     """Get last seen info for each cat"""
