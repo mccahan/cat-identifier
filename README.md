@@ -55,3 +55,6 @@ Achieved 100% validation accuracy. Model is exported to ONNX for inference.
 - `POST /api/feedback` - Submit correction
 - `GET /api/stats` - Sighting statistics
 - `POST /api/poll` - Trigger manual poll
+
+---
+*Built 2026-03-28*
