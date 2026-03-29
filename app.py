@@ -94,9 +94,11 @@ def preprocess_image(image_bytes):
     
     # Convert to numpy and normalize (ImageNet stats)
     img_array = np.array(img).astype(np.float32) / 255.0
-    img_array = (img_array - [0.485, 0.456, 0.406]) / [0.229, 0.224, 0.225]
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img_array = (img_array - mean) / std
     img_array = img_array.transpose(2, 0, 1)  # HWC -> CHW
-    img_array = np.expand_dims(img_array, 0)  # Add batch dimension
+    img_array = np.expand_dims(img_array, 0).astype(np.float32)  # Add batch dimension
     
     return img_array
 
