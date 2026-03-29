@@ -127,16 +127,16 @@ def get_db():
     """Get database connection"""
     return sqlite3.connect(str(DATA_DIR / "sightings.db"))
 
-def poll_frigate():
+def poll_frigate(lookback_hours=24):
     """Poll Frigate for new cat events"""
     print("Polling Frigate for cat events...")
     
     try:
-        # Get recent cat events (last hour)
-        after = time.time() - 3600
+        # Get recent cat events
+        after = time.time() - (lookback_hours * 3600)
         resp = requests.get(
             f"{FRIGATE_URL}/api/events",
-            params={"label": "cat", "after": after, "limit": 50},
+            params={"label": "cat", "after": after, "limit": 100},
             timeout=10
         )
         resp.raise_for_status()
