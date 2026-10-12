@@ -197,6 +197,32 @@
         }
         
         .sighting-card:hover .feedback-btn { opacity: 1; }
+
+        /* No hover on touch screens: always show the Fix button */
+        @media (hover: none), (pointer: coarse) {
+            .sighting-card .feedback-btn { opacity: 1; }
+        }
+
+        .cat-card .fix-btn {
+            margin-top: 12px;
+            padding: 6px 14px;
+        }
+
+        .filters {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .filters .btn.active {
+            background: var(--text);
+            color: var(--bg);
+        }
+
+        .load-more {
+            display: block;
+            margin: 20px auto 0;
+        }
         
         .feedback-modal {
             display: none;
@@ -319,10 +345,18 @@
             <h2>Recent Sightings</h2>
             <button class="btn" onclick="refreshData()">🔄 Refresh</button>
         </div>
-        
+
+        <div class="filters" id="filters" style="margin-bottom: 20px;">
+            <button class="btn active" data-cat="" onclick="setFilter('')">All</button>
+            <button class="btn" data-cat="hawthorne" onclick="setFilter('hawthorne')">Hawthorne</button>
+            <button class="btn" data-cat="roxie" onclick="setFilter('roxie')">Roxie</button>
+            <button class="btn" data-cat="sadie" onclick="setFilter('sadie')">Sadie</button>
+        </div>
+
         <div class="recent-grid" id="recent">
             <div class="loading">Loading...</div>
         </div>
+        <button class="btn load-more" id="load-more" onclick="loadMore()" hidden>Load more</button>
     </div>
     
     <div class="feedback-modal" id="feedback-modal">
@@ -384,6 +418,7 @@
                             <div class="details">
                                 ${info.camera} • ${info.confidence > 0 ? (info.confidence * 100).toFixed(0) + '%' : 'Corrected'}
                             </div>
+                            <button class="btn fix-btn" onclick="openFeedback(${info.sighting_id}, '${cat}')">✏️ Fix</button>
                         `;
                     } else {
                         card.innerHTML = `
@@ -401,40 +436,83 @@
             }
         }
         
+        const PAGE_SIZE = 12;
+        let recentFilter = '';
+        let recentShown = [];
+
+        function recentUrl(limit, before) {
+            const params = new URLSearchParams({ limit });
+            if (recentFilter) params.set('cat', recentFilter);
+            if (before !== undefined) params.set('before', before);
+            return `/api/recent?${params}`;
+        }
+
+        function setFilter(cat) {
+            recentFilter = cat;
+            recentShown = [];
+            for (const b of document.querySelectorAll('#filters .btn')) {
+                b.classList.toggle('active', b.dataset.cat === cat);
+            }
+            loadRecent();
+        }
+
+        async function loadMore() {
+            const last = recentShown[recentShown.length - 1];
+            if (!last) return;
+            try {
+                const resp = await fetch(recentUrl(PAGE_SIZE, last.timestamp));
+                renderRecent(await resp.json(), true);
+            } catch (e) {
+                console.error('Error loading more:', e);
+            }
+        }
+
         async function loadRecent() {
             try {
-                const resp = await fetch('/api/recent?limit=12');
-                const data = await resp.json();
-                
-                const container = document.getElementById('recent');
-                container.innerHTML = '';
-                
-                for (const sighting of data) {
-                    const card = document.createElement('div');
-                    card.className = 'sighting-card';
-                    
-                    const confClass = sighting.confidence < 0 ? 'corrected' : 
-                                     sighting.confidence < 0.7 ? 'low' : '';
-                    const confText = sighting.confidence < 0 ? 'Corrected' : 
-                                    `${(sighting.confidence * 100).toFixed(0)}%`;
-                    
-                    card.innerHTML = `
-                        <img src="/api/sighting/${sighting.id}/thumbnail" alt="${sighting.cat_name}">
-                        <span class="confidence ${confClass}">${confText}</span>
-                        <button class="feedback-btn" onclick="openFeedback(${sighting.id}, '${sighting.cat_name}')">✏️ Fix</button>
-                        <div class="info">
-                            <div class="cat-name">${sighting.cat_name}</div>
-                            <div class="meta">${sighting.camera} • ${timeAgo(sighting.timestamp)}</div>
-                        </div>
-                    `;
-                    
-                    container.appendChild(card);
-                }
+                // Keep however many were loaded with "Load more" when refreshing
+                const limit = Math.max(PAGE_SIZE, recentShown.length);
+                const resp = await fetch(recentUrl(limit));
+                renderRecent(await resp.json(), false, limit);
             } catch (e) {
                 console.error('Error loading recent:', e);
             }
         }
-        
+
+        function renderRecent(data, append, limit = PAGE_SIZE) {
+            const container = document.getElementById('recent');
+            if (!append) {
+                container.innerHTML = '';
+                recentShown = [];
+            }
+            recentShown.push(...data);
+            document.getElementById('load-more').hidden = data.length < limit;
+            if (!recentShown.length) {
+                container.innerHTML = '<div class="loading">No sightings</div>';
+            }
+
+            for (const sighting of data) {
+                const card = document.createElement('div');
+                card.className = 'sighting-card';
+                
+                const confClass = sighting.confidence < 0 ? 'corrected' : 
+                                 sighting.confidence < 0.7 ? 'low' : '';
+                const confText = sighting.confidence < 0 ? 'Corrected' : 
+                                `${(sighting.confidence * 100).toFixed(0)}%`;
+                
+                card.innerHTML = `
+                    <img src="/api/sighting/${sighting.id}/thumbnail" alt="${sighting.cat_name}">
+                    <span class="confidence ${confClass}">${confText}</span>
+                    <button class="feedback-btn" onclick="openFeedback(${sighting.id}, '${sighting.cat_name}')">✏️ Fix</button>
+                    <div class="info">
+                        <div class="cat-name">${sighting.cat_name}</div>
+                        <div class="meta">${sighting.camera} • ${timeAgo(sighting.timestamp)}</div>
+                    </div>
+                `;
+                
+                container.appendChild(card);
+            }
+        }
+
         async function loadStats() {
             try {
                 const resp = await fetch('/api/stats');
@@ -467,7 +545,7 @@
             if (!currentFeedbackSighting) return;
             
             try {
-                await fetch('/api/feedback', {
+                const resp = await fetch('/api/feedback', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -475,6 +553,7 @@
                         correct_label: correctLabel
                     })
                 });
+                if (!resp.ok) throw new Error((await resp.json()).error || resp.statusText);
                 
                 closeFeedback();
                 refreshData();

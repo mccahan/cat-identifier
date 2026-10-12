@@ -256,19 +256,31 @@ def get_cats():
 
 @app.route('/api/recent')
 def get_recent():
-    """Get recent sightings with images"""
+    """Get recent sightings with images, optionally for one cat and before a timestamp (for paging)"""
     limit = request.args.get('limit', 20, type=int)
-    
+    cat = request.args.get('cat')
+    before = request.args.get('before', type=float)
+
+    where, params = [], []
+    if cat:
+        where.append("cat_name = ?")
+        params.append(cat)
+    if before is not None:
+        where.append("timestamp < ?")
+        params.append(before)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
     with db_lock:
         conn = get_db()
         c = conn.cursor()
-        
-        c.execute('''
+
+        c.execute(f'''
             SELECT id, event_id, cat_name, confidence, camera, timestamp
             FROM sightings
+            {where_sql}
             ORDER BY timestamp DESC
             LIMIT ?
-        ''', (limit,))
+        ''', (*params, limit))
         
         rows = c.fetchall()
         conn.close()
