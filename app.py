@@ -3,7 +3,12 @@
 Cat Identifier - Track when each cat was last seen using Frigate events
 """
 import os
+import sys
+import re
+import ast
 import json
+import shutil
+import subprocess
 import time
 import sqlite3
 import threading
@@ -26,6 +31,11 @@ LABELS_PATH = Path(os.getenv("LABELS_PATH", "/app/models/cat_classifier_labels.t
 TRAINING_DIR = Path(os.getenv("TRAINING_DIR", "/training"))
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "/models"))
 RETRAIN_THRESHOLD = int(os.getenv("RETRAIN_THRESHOLD", "10"))  # corrections before suggesting retrain
+SAMPLE_PER_CAT = int(os.getenv("SAMPLE_PER_CAT", "250"))  # confident sightings per cat a retrain adds
+SAMPLE_MIN_CONFIDENCE = float(os.getenv("SAMPLE_MIN_CONFIDENCE", "0.9"))
+TRAIN_TIMEOUT = int(os.getenv("TRAIN_TIMEOUT", "3600"))  # seconds
+TRAINING_STATE = DATA_DIR / "training.json"
+MODEL_FILES = ("cat_classifier.onnx", "cat_classifier_labels.txt", "cat_classifier.pth")
 NOT_A_CAT = "not_a_cat"  # Label for sightings that turned out not to be a cat: hidden, and never trained on
 
 # Initialize Flask app
@@ -37,6 +47,8 @@ model_lock = threading.Lock()
 model_session = None
 labels = []
 is_training = False
+training_lock = threading.Lock()
+loaded_model_path = None
 
 def init_db():
     """Initialize SQLite database"""
@@ -77,7 +89,7 @@ def init_db():
 
 def load_model():
     """Load ONNX model and labels"""
-    global model_session, labels
+    global model_session, labels, loaded_model_path
     
     # Check for model in MODELS_DIR first (for hot-reload after training)
     model_path = MODELS_DIR / "cat_classifier.onnx" if (MODELS_DIR / "cat_classifier.onnx").exists() else MODEL_PATH
@@ -85,6 +97,7 @@ def load_model():
     with model_lock:
         if model_path.exists():
             model_session = ort.InferenceSession(str(model_path))
+            loaded_model_path = model_path
             print(f"Loaded model from {model_path}")
         else:
             print(f"Warning: Model not found at {model_path}")
@@ -447,14 +460,29 @@ def trigger_poll():
     threading.Thread(target=poll_frigate, daemon=True).start()
     return jsonify({"success": True, "message": "Poll triggered"})
 
+def read_training_state():
+    """The last (or running) retrain: status, step, epoch, images, accuracy, error, using"""
+    try:
+        return json.loads(TRAINING_STATE.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+
+def write_training_state(state):
+    tmp = TRAINING_STATE.with_suffix('.tmp')
+    tmp.write_text(json.dumps(state))
+    tmp.replace(TRAINING_STATE)
+
+def count_images(folder):
+    return len(list(folder.glob("*.jpg"))) if folder.exists() else 0
+
 @app.route('/api/retrain/status')
 def retrain_status():
-    """Get retraining status and correction counts"""
+    """Get retraining status, what a retrain would learn from, and the last one's result"""
     with db_lock:
         conn = get_db()
         c = conn.cursor()
         
-        # Count corrections per cat
+        # Count corrections per label
         c.execute('''
             SELECT correct_label, COUNT(*) 
             FROM feedback 
@@ -462,29 +490,42 @@ def retrain_status():
         ''')
         corrections_by_cat = {row[0]: row[1] for row in c.fetchall()}
         
-        # Count original training images
-        original_counts = {}
-        if TRAINING_DIR.exists():
-            for label in labels:
-                original_path = TRAINING_DIR / "original" / label
-                if original_path.exists():
-                    original_counts[label] = len(list(original_path.glob("*.jpg")))
-                corrections_path = TRAINING_DIR / "corrections" / label
-                if corrections_path.exists():
-                    corrections_by_cat[label] = corrections_by_cat.get(label, 0)
-        
         c.execute("SELECT COUNT(*) FROM feedback")
         total_corrections = c.fetchone()[0]
         
+        # Confident sightings, which a retrain samples from
+        c.execute('''
+            SELECT cat_name, COUNT(*)
+            FROM sightings
+            WHERE confidence >= ?
+            GROUP BY cat_name
+        ''', (SAMPLE_MIN_CONFIDENCE,))
+        confident = {row[0]: row[1] for row in c.fetchall()}
+        
         conn.close()
     
+    original_counts = {label: count_images(TRAINING_DIR / "original" / label) for label in labels}
+    # Images a retrain would use per cat: originals, corrections and the sample
+    planned = {
+        label: original_counts[label]
+            + count_images(TRAINING_DIR / "corrections" / label)
+            + min(SAMPLE_PER_CAT, confident.get(label, 0))
+        for label in labels
+    }
+    
+    state = read_training_state()
     return jsonify({
         "is_training": is_training,
         "total_corrections": total_corrections,
         "corrections_by_cat": corrections_by_cat,
         "original_counts": original_counts,
+        "planned": planned,
         "retrain_threshold": RETRAIN_THRESHOLD,
-        "can_retrain": total_corrections > 0 and not is_training
+        "can_retrain": not is_training,
+        "training": state,
+        # When the model in use was trained (null: the one built into the image)
+        "model_trained_at": loaded_model_path.stat().st_mtime if loaded_model_path and loaded_model_path.parent == MODELS_DIR else None,
+        "can_undo": not is_training and state.get("using") in ("new", "previous"),
     })
 
 @app.route('/api/retrain', methods=['POST'])
@@ -492,33 +533,63 @@ def trigger_retrain():
     """Trigger model retraining"""
     global is_training
     
-    if is_training:
-        return jsonify({"error": "Training already in progress"}), 409
+    with training_lock:
+        if is_training:
+            return jsonify({"error": "Training already in progress"}), 409
+        is_training = True
     
-    # Check if we have corrections
-    with db_lock:
-        conn = get_db()
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM feedback")
-        corrections = c.fetchone()[0]
-        conn.close()
-    
-    if corrections == 0:
-        return jsonify({"error": "No corrections to train on"}), 400
-    
-    # Start training in background
-    is_training = True
+    state = {"status": "running", "started_at": time.time(), "step": "Exporting training images"}
+    # A failed run leaves the models as they were, so an earlier run's undo still applies
+    if read_training_state().get("using"):
+        state["using"] = read_training_state()["using"]
+    write_training_state(state)
     threading.Thread(target=run_training, daemon=True).start()
     
     return jsonify({
         "success": True, 
-        "message": f"Training started with {corrections} corrections",
+        "message": "Training started",
         "status_url": "/api/retrain/status"
     })
 
+@app.route('/api/retrain/undo', methods=['POST'])
+def undo_retrain():
+    """Switch between the retrained model and the one it replaced"""
+    with training_lock:
+        if is_training:
+            return jsonify({"error": "Training in progress"}), 409
+        state = read_training_state()
+        if state.get("using") not in ("new", "previous"):
+            return jsonify({"error": "There's no previous model to go back to"}), 400
+        swap_models(MODELS_DIR, MODELS_DIR / "previous")
+        load_model()
+        state["using"] = "previous" if state["using"] == "new" else "new"
+        write_training_state(state)
+    return jsonify({"success": True, "using": state["using"]})
+
+def swap_models(a, b):
+    """Exchange the model files of two folders (one missing from a folder ends up missing from the other)"""
+    b.mkdir(parents=True, exist_ok=True)
+    tmp = MODELS_DIR / ".swap"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir()
+    for name in MODEL_FILES:
+        if (a / name).exists():
+            (a / name).replace(tmp / name)
+        if (b / name).exists():
+            (b / name).replace(a / name)
+        if (tmp / name).exists():
+            (tmp / name).replace(b / name)
+    tmp.rmdir()
+
 def run_training():
-    """Run the training process"""
+    """Run the training process: export, train into a candidate folder, then swap it in"""
     global is_training
+    
+    state = read_training_state()
+    candidate = MODELS_DIR / "candidate"
+    previous = MODELS_DIR / "previous"
+    log = []
+    timed_out = threading.Event()
     
     try:
         print("Starting model retraining...")
@@ -526,74 +597,110 @@ def run_training():
         # Ensure directories exist
         TRAINING_DIR.mkdir(parents=True, exist_ok=True)
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(candidate, ignore_errors=True)
         
-        # Export all sightings with current labels as training data
         export_training_data()
+        state["step"] = "Training"
+        write_training_state(state)
         
-        # Run the training script
-        import subprocess
-        result = subprocess.run(
-            ["python3", "/app/train.py"],
-            capture_output=True,
-            text=True,
-            timeout=600  # 10 minute timeout
+        # Train into the candidate folder; the live model is untouched until it succeeds
+        env = {**os.environ, "OUTPUT_DIR": str(candidate), "TORCH_HOME": str(MODELS_DIR / ".torch")}
+        proc = subprocess.Popen(
+            [sys.executable, "-u", str(Path(__file__).parent / "train.py")],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env
         )
+        def kill():
+            timed_out.set()
+            proc.kill()
+        timer = threading.Timer(TRAIN_TIMEOUT, kill)
+        timer.start()
         
-        if result.returncode == 0:
-            print("Training completed successfully!")
-            print(result.stdout)
-            
-            # Reload the model
-            load_model()
-            print("Model reloaded")
-        else:
-            print(f"Training failed: {result.stderr}")
-            
+        for line in proc.stdout:
+            line = line.rstrip()
+            print(line)
+            log = (log + [line])[-15:]
+            epoch = re.match(r"Epoch (\d+)/(\d+)", line)
+            best = re.match(r"Best validation accuracy: ([\d.]+)%", line)
+            if epoch:
+                state["epoch"], state["epochs"] = int(epoch[1]), int(epoch[2])
+            elif line.startswith("Per-label counts:"):
+                state["images"] = ast.literal_eval(line.split(":", 1)[1].strip())
+            elif best:
+                state["accuracy"] = float(best[1])
+            else:
+                continue
+            write_training_state(state)
+        
+        proc.wait()
+        timer.cancel()
+        if timed_out.is_set():
+            raise RuntimeError(f"Stopped after {TRAIN_TIMEOUT // 60} minutes")
+        if proc.returncode != 0:
+            # The last line is usually the error itself (or train.py saying why it stopped)
+            raise RuntimeError(log[-1] if log else f"train.py failed (exit code {proc.returncode})")
+        if not (candidate / "cat_classifier.onnx").exists():
+            raise RuntimeError("Training didn't produce a model")
+        
+        # Keep the model it replaces, for undo
+        shutil.rmtree(previous, ignore_errors=True)
+        swap_models(MODELS_DIR, previous)
+        swap_models(MODELS_DIR, candidate)
+        load_model()
+        print("Training completed, model reloaded")
+        state.update(status="done", using="new")
     except Exception as e:
         print(f"Training error: {e}")
+        state.update(status="failed", error=str(e), log=log)
     finally:
+        state.pop("step", None)
+        state["finished_at"] = time.time()
+        write_training_state(state)
+        shutil.rmtree(candidate, ignore_errors=True)
         is_training = False
 
 def export_training_data():
-    """Export current sightings as training data"""
+    """Export a sample of confident sightings per cat, and drop corrections of relabeled sightings"""
     print("Exporting training data...")
     
     with db_lock:
         conn = get_db()
         c = conn.cursor()
         
-        # Get all sightings with their current labels
-        c.execute('''
-            SELECT id, cat_name, thumbnail 
-            FROM sightings 
-            WHERE thumbnail IS NOT NULL
-        ''')
+        c.execute("SELECT id, cat_name FROM sightings")
+        current_labels = {row[0]: row[1] for row in c.fetchall()}
         
-        rows = c.fetchall()
-
-        # Drop copies whose sighting has since been relabeled (or marked not a cat), so it
-        # isn't trained under its old label too. Files are named <id>.jpg / <id>_<time>.jpg
-        current_labels = {row[0]: row[1] for row in rows}
-        for kind in ("current", "corrections"):
-            for filepath in TRAINING_DIR.glob(f"{kind}/*/*.jpg"):
-                stem = filepath.stem.split('_')[0]
-                if stem.isdigit() and int(stem) in current_labels and current_labels[int(stem)] != filepath.parent.name:
-                    filepath.unlink(missing_ok=True)
-
-        for row in rows:
-            sighting_id, label, thumbnail = row
-            if thumbnail and label in labels:
-                training_path = TRAINING_DIR / "current" / label
-                training_path.mkdir(parents=True, exist_ok=True)
-                
-                filepath = training_path / f"{sighting_id}.jpg"
-                if not filepath.exists():
-                    with open(filepath, 'wb') as f:
-                        f.write(thumbnail)
+        # Up to SAMPLE_PER_CAT confident sightings per cat, at random so they span day and night.
+        # Corrected sightings (confidence -1) are already in corrections/
+        samples = {}
+        for label in labels:
+            c.execute('''
+                SELECT id, thumbnail
+                FROM sightings
+                WHERE cat_name = ? AND confidence >= ? AND thumbnail IS NOT NULL
+                ORDER BY RANDOM()
+                LIMIT ?
+            ''', (label, SAMPLE_MIN_CONFIDENCE, SAMPLE_PER_CAT))
+            samples[label] = c.fetchall()
         
         conn.close()
     
-    print("Training data exported")
+    # Drop corrections whose sighting has since been relabeled (or marked not a cat), so it
+    # isn't trained under its old label too. Files are named <id>_<time>.jpg
+    for filepath in TRAINING_DIR.glob("corrections/*/*.jpg"):
+        stem = filepath.stem.split('_')[0]
+        if stem.isdigit() and int(stem) in current_labels and current_labels[int(stem)] != filepath.parent.name:
+            filepath.unlink(missing_ok=True)
+    
+    # A fresh sample each time
+    current_dir = TRAINING_DIR / "current"
+    shutil.rmtree(current_dir, ignore_errors=True)
+    for label, rows in samples.items():
+        training_path = current_dir / label
+        training_path.mkdir(parents=True, exist_ok=True)
+        for sighting_id, thumbnail in rows:
+            (training_path / f"{sighting_id}.jpg").write_bytes(thumbnail)
+    
+    print(f"Training data exported: {({label: len(rows) for label, rows in samples.items()})}")
 
 @app.route('/api/model/reload', methods=['POST'])
 def reload_model():
@@ -605,6 +712,12 @@ if __name__ == '__main__':
     print("Initializing Cat Identifier...")
     init_db()
     load_model()
+    
+    state = read_training_state()
+    if state.get("status") == "running":
+        state.update(status="failed", error="Interrupted by a restart", finished_at=time.time())
+        state.pop("step", None)
+        write_training_state(state)
     
     # Start background polling
     polling_thread = threading.Thread(target=polling_loop, daemon=True)

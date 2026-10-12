@@ -308,6 +308,25 @@
             font-size: 0.85rem;
         }
         
+        .model-bar {
+            background: var(--card);
+            border-radius: 12px;
+            padding: 15px 20px;
+            margin: -10px auto 40px;
+            max-width: 720px;
+            display: flex;
+            gap: 12px 20px;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+        }
+        
+        .model-bar .model-info { font-size: 0.9rem; }
+        .model-bar .model-info .muted { color: var(--muted); }
+        .model-bar .model-info .failed { color: #f87171; }
+        .model-bar .model-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+        .model-bar .btn:disabled { opacity: 0.5; cursor: default; }
+        
         .loading {
             text-align: center;
             padding: 40px;
@@ -339,6 +358,14 @@
             <div class="stat">
                 <div class="value" id="stat-corrections">-</div>
                 <div class="label">Corrections</div>
+            </div>
+        </div>
+        
+        <div class="model-bar">
+            <div class="model-info" id="model-info">Loading model…</div>
+            <div class="model-actions">
+                <button class="btn" id="undo-btn" onclick="undoRetrain()" hidden></button>
+                <button class="btn" id="retrain-btn" onclick="startRetrain()">🧠 Retrain</button>
             </div>
         </div>
         
@@ -574,6 +601,88 @@
             }
         }
         
+        let trainingPoll = null;
+        let retrainPlan = null;
+        
+        function minutesText(seconds) {
+            const m = Math.round(seconds / 60);
+            return m < 1 ? 'under a minute' : m === 1 ? '1 minute' : `${m} minutes`;
+        }
+        
+        async function loadTraining() {
+            try {
+                const resp = await fetch('/api/retrain/status');
+                const data = await resp.json();
+                const t = data.training || {};
+                retrainPlan = data.planned;
+                const info = document.getElementById('model-info');
+                const retrainBtn = document.getElementById('retrain-btn');
+                const undoBtn = document.getElementById('undo-btn');
+                
+                if (data.is_training) {
+                    const elapsed = minutesText(Date.now() / 1000 - t.started_at);
+                    const step = t.epoch ? `epoch ${t.epoch} of ${t.epochs}` : (t.step || 'Starting').toLowerCase();
+                    info.innerHTML = `🧠 Retraining… ${step} <span class="muted">· ${elapsed} so far</span>`;
+                    retrainBtn.disabled = true;
+                    retrainBtn.textContent = 'Training…';
+                    if (!trainingPoll) trainingPoll = setInterval(loadTraining, 5000);
+                } else {
+                    if (trainingPoll) {
+                        // Just finished
+                        clearInterval(trainingPoll);
+                        trainingPoll = null;
+                        refreshData();
+                    }
+                    const trained = data.model_trained_at
+                        ? `Model trained ${new Date(data.model_trained_at * 1000).toLocaleDateString()}`
+                        : 'Built-in model';
+                    let last = '';
+                    if (t.status === 'done') {
+                        const images = Object.values(t.images || {}).reduce((a, b) => a + b, 0);
+                        const took = minutesText(t.finished_at - t.started_at);
+                        last = ` <span class="muted">· ${t.accuracy}% validation accuracy on ${images.toLocaleString()} images, took ${took}</span>`;
+                        if (t.using === 'previous') last = ' <span class="muted">· using the model from before the last retrain</span>';
+                    } else if (t.status === 'failed') {
+                        last = ` <span class="failed">· last retrain failed: ${t.error}</span>`;
+                    }
+                    info.innerHTML = `${trained}${last}`;
+                    retrainBtn.disabled = false;
+                    retrainBtn.textContent = `🧠 Retrain${data.total_corrections ? ` (${data.total_corrections} corrections)` : ''}`;
+                }
+                
+                undoBtn.hidden = !data.can_undo;
+                undoBtn.textContent = t.using === 'previous' ? '↪️ Use retrained model' : '↩️ Use previous model';
+            } catch (e) {
+                console.error('Error loading training status:', e);
+            }
+        }
+        
+        async function startRetrain() {
+            const plan = retrainPlan || {};
+            const total = Object.values(plan).reduce((a, b) => a + b, 0);
+            const perCat = Object.entries(plan).map(([cat, n]) => `${cat} ${n}`).join(', ');
+            // About 1.6 s per batch of 16 on tower's CPU, 80% of images, 10 epochs
+            const estimate = Math.max(5, Math.ceil(total * 0.8 / 16 * 1.6 * 10 / 60 / 5) * 5);
+            if (!confirm(`Retrain on ${total.toLocaleString()} images (${perCat})?\n\nIt takes about ${estimate} minutes. The current model keeps working meanwhile, and stays available to go back to.`)) return;
+            try {
+                const resp = await fetch('/api/retrain', { method: 'POST' });
+                if (!resp.ok) throw new Error((await resp.json()).error || resp.statusText);
+                loadTraining();
+            } catch (e) {
+                alert(`Couldn't start retraining: ${e.message}`);
+            }
+        }
+        
+        async function undoRetrain() {
+            try {
+                const resp = await fetch('/api/retrain/undo', { method: 'POST' });
+                if (!resp.ok) throw new Error((await resp.json()).error || resp.statusText);
+                loadTraining();
+            } catch (e) {
+                alert(`Couldn't switch models: ${e.message}`);
+            }
+        }
+        
         function refreshData() {
             loadLastSeen();
             loadRecent();
@@ -582,9 +691,10 @@
         
         // Initial load
         refreshData();
+        loadTraining();
         
         // Auto-refresh every 2 minutes
-        setInterval(refreshData, 120000);
+        setInterval(() => { refreshData(); loadTraining(); }, 120000);
         
         // Close modal on escape
         document.addEventListener('keydown', (e) => {

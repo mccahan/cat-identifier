@@ -25,6 +25,7 @@ except ImportError as e:
 # Configuration
 TRAINING_DIR = Path(os.getenv("TRAINING_DIR", "/training"))
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "/models"))
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", str(MODELS_DIR)))  # where the trained model is written
 LABELS = ["hawthorne", "roxie", "sadie"]
 IMG_SIZE = 128
 BATCH_SIZE = 16
@@ -151,8 +152,11 @@ def train_model():
     print(f"Using device: {device}")
     model = model.to(device)
     
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
+    # Loss and optimizer, weighting each cat by how rare it is so the most-seen one doesn't dominate
+    counts = [list(train_labels).count(label) for label in LABELS]
+    weights = [len(train_labels) / (len(LABELS) * n) if n else 0.0 for n in counts]
+    print(f"Class weights: {dict(zip(LABELS, [round(w, 2) for w in weights]))}")
+    criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float32).to(device))
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
     # Training loop
@@ -205,7 +209,8 @@ def train_model():
         # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_model_state = model.state_dict().copy()
+            # Clone: state_dict() shares tensors that later epochs keep changing
+            best_model_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
     
     print(f"\nBest validation accuracy: {best_val_acc:.1f}%")
     
@@ -214,9 +219,9 @@ def train_model():
         model.load_state_dict(best_model_state)
     
     # Save PyTorch model
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), MODELS_DIR / "cat_classifier.pth")
-    print(f"Saved PyTorch model to {MODELS_DIR / 'cat_classifier.pth'}")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), OUTPUT_DIR / "cat_classifier.pth")
+    print(f"Saved PyTorch model to {OUTPUT_DIR / 'cat_classifier.pth'}")
     
     # Export to ONNX
     model.eval()
@@ -226,7 +231,7 @@ def train_model():
     torch.onnx.export(
         model,
         dummy_input,
-        str(MODELS_DIR / "cat_classifier.onnx"),
+        str(OUTPUT_DIR / "cat_classifier.onnx"),
         opset_version=12,
         input_names=['input'],
         output_names=['output'],
@@ -235,17 +240,17 @@ def train_model():
     )
     
     # Verify ONNX file size (should be ~8MB with weights)
-    onnx_size = (MODELS_DIR / "cat_classifier.onnx").stat().st_size
+    onnx_size = (OUTPUT_DIR / "cat_classifier.onnx").stat().st_size
     print(f"Exported ONNX model: {onnx_size / 1024 / 1024:.1f} MB")
     
     if onnx_size < 1_000_000:  # Less than 1MB means weights weren't embedded
         print("WARNING: ONNX file seems too small, weights may not be embedded!")
     
     # Save labels
-    with open(MODELS_DIR / "cat_classifier_labels.txt", 'w') as f:
+    with open(OUTPUT_DIR / "cat_classifier_labels.txt", 'w') as f:
         f.write('\n'.join(LABELS))
     
-    print(f"Saved labels to {MODELS_DIR / 'cat_classifier_labels.txt'}")
+    print(f"Saved labels to {OUTPUT_DIR / 'cat_classifier_labels.txt'}")
     print("\nTraining complete!")
 
 if __name__ == '__main__':
