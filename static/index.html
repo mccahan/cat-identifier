@@ -163,6 +163,8 @@
             margin-bottom: 4px;
         }
         
+        .sighting-card .cat-name.not-cat { text-transform: none; }
+        
         .sighting-card .meta {
             font-size: 0.8rem;
             color: var(--muted);
@@ -224,6 +226,8 @@
             margin: 20px auto 0;
         }
         
+        .load-more[hidden] { display: none; }
+        
         .feedback-modal {
             display: none;
             position: fixed;
@@ -276,6 +280,7 @@
         .feedback-buttons .hawthorne-btn { background: var(--hawthorne); color: #fff; }
         .feedback-buttons .roxie-btn { background: var(--roxie); color: #fff; }
         .feedback-buttons .sadie-btn { background: var(--sadie); color: #333; }
+        .feedback-buttons .not-cat-btn { background: #7f1d1d; color: #fff; }
         .feedback-buttons .cancel-btn { background: var(--muted); color: #fff; }
         
         .stats {
@@ -351,6 +356,7 @@
             <button class="btn" data-cat="hawthorne" onclick="setFilter('hawthorne')">Hawthorne</button>
             <button class="btn" data-cat="roxie" onclick="setFilter('roxie')">Roxie</button>
             <button class="btn" data-cat="sadie" onclick="setFilter('sadie')">Sadie</button>
+            <button class="btn" data-cat="not_a_cat" onclick="setFilter('not_a_cat')">Not a cat</button>
         </div>
 
         <div class="recent-grid" id="recent">
@@ -368,6 +374,7 @@
                 <button class="hawthorne-btn" onclick="submitFeedback('hawthorne')">⬛ Hawthorne</button>
                 <button class="roxie-btn" onclick="submitFeedback('roxie')">🟫 Roxie</button>
                 <button class="sadie-btn" onclick="submitFeedback('sadie')">⬜ Sadie</button>
+                <button class="not-cat-btn" onclick="submitFeedback('not_a_cat')">🚫 Not a cat</button>
                 <button class="cancel-btn" onclick="closeFeedback()">Cancel</button>
             </div>
         </div>
@@ -375,6 +382,10 @@
     
     <script>
         let currentFeedbackSighting = null;
+        
+        function catLabel(name) {
+            return name === 'not_a_cat' ? 'Not a cat' : name;
+        }
         
         function timeAgo(timestamp) {
             const seconds = Math.floor(Date.now() / 1000 - timestamp);
@@ -500,11 +511,11 @@
                                 `${(sighting.confidence * 100).toFixed(0)}%`;
                 
                 card.innerHTML = `
-                    <img src="/api/sighting/${sighting.id}/thumbnail" alt="${sighting.cat_name}">
+                    <img src="/api/sighting/${sighting.id}/thumbnail" alt="${catLabel(sighting.cat_name)}">
                     <span class="confidence ${confClass}">${confText}</span>
                     <button class="feedback-btn" onclick="openFeedback(${sighting.id}, '${sighting.cat_name}')">✏️ Fix</button>
                     <div class="info">
-                        <div class="cat-name">${sighting.cat_name}</div>
+                        <div class="cat-name${sighting.cat_name === 'not_a_cat' ? ' not-cat' : ''}">${catLabel(sighting.cat_name)}</div>
                         <div class="meta">${sighting.camera} • ${timeAgo(sighting.timestamp)}</div>
                     </div>
                 `;
@@ -532,7 +543,7 @@
         function openFeedback(sightingId, currentLabel) {
             currentFeedbackSighting = sightingId;
             document.getElementById('feedback-img').src = `/api/sighting/${sightingId}/thumbnail`;
-            document.getElementById('feedback-current').innerHTML = `Currently labeled: <strong>${currentLabel}</strong>`;
+            document.getElementById('feedback-current').innerHTML = `Currently labeled: <strong>${catLabel(currentLabel)}</strong>`;
             document.getElementById('feedback-modal').classList.add('active');
         }
         

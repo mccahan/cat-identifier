@@ -26,6 +26,7 @@ LABELS_PATH = Path(os.getenv("LABELS_PATH", "/app/models/cat_classifier_labels.t
 TRAINING_DIR = Path(os.getenv("TRAINING_DIR", "/training"))
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "/models"))
 RETRAIN_THRESHOLD = int(os.getenv("RETRAIN_THRESHOLD", "10"))  # corrections before suggesting retrain
+NOT_A_CAT = "not_a_cat"  # Label for sightings that turned out not to be a cat: hidden, and never trained on
 
 # Initialize Flask app
 app = Flask(__name__, static_folder='static')
@@ -265,6 +266,10 @@ def get_recent():
     if cat:
         where.append("cat_name = ?")
         params.append(cat)
+    else:
+        # Not-a-cat sightings only show when asked for (cat=not_a_cat)
+        where.append("cat_name != ?")
+        params.append(NOT_A_CAT)
     if before is not None:
         where.append("timestamp < ?")
         params.append(before)
@@ -312,6 +317,12 @@ def get_thumbnail(sighting_id):
         return send_file(BytesIO(row[0]), mimetype='image/jpeg')
     return "Not found", 404
 
+def forget_training_images(sighting_id):
+    """Remove a sighting's earlier correction and exported images, under any label"""
+    for pattern in (f"corrections/*/{sighting_id}_*.jpg", f"current/*/{sighting_id}.jpg"):
+        for filepath in TRAINING_DIR.glob(pattern):
+            filepath.unlink(missing_ok=True)
+
 def save_training_image(thumbnail_bytes, label, sighting_id):
     """Save a corrected image to the training directory"""
     training_path = TRAINING_DIR / "corrections" / label
@@ -336,8 +347,8 @@ def submit_feedback():
     if not sighting_id or not correct_label:
         return jsonify({"error": "Missing sighting_id or correct_label"}), 400
     
-    if correct_label not in labels:
-        return jsonify({"error": f"Invalid label. Must be one of: {labels}"}), 400
+    if correct_label not in labels and correct_label != NOT_A_CAT:
+        return jsonify({"error": f"Invalid label. Must be one of: {labels + [NOT_A_CAT]}"}), 400
     
     with db_lock:
         conn = get_db()
@@ -373,8 +384,9 @@ def submit_feedback():
         conn.commit()
         conn.close()
     
-    # Save the image to training directory
-    if thumbnail:
+    # Replace any training copies under its old label; not-a-cat ones aren't trained on at all
+    forget_training_images(sighting_id)
+    if thumbnail and correct_label != NOT_A_CAT:
         save_training_image(thumbnail, correct_label, sighting_id)
     
     response = {
@@ -402,8 +414,9 @@ def get_stats():
         c.execute('''
             SELECT cat_name, COUNT(*) as count
             FROM sightings
+            WHERE cat_name != ?
             GROUP BY cat_name
-        ''')
+        ''', (NOT_A_CAT,))
         totals = {row[0]: row[1] for row in c.fetchall()}
         
         # Corrections count
@@ -415,9 +428,9 @@ def get_stats():
         c.execute('''
             SELECT cat_name, COUNT(*) as count
             FROM sightings
-            WHERE timestamp >= ?
+            WHERE timestamp >= ? AND cat_name != ?
             GROUP BY cat_name
-        ''', (today_start,))
+        ''', (today_start, NOT_A_CAT))
         today = {row[0]: row[1] for row in c.fetchall()}
         
         conn.close()
@@ -556,7 +569,18 @@ def export_training_data():
             WHERE thumbnail IS NOT NULL
         ''')
         
-        for row in c.fetchall():
+        rows = c.fetchall()
+
+        # Drop copies whose sighting has since been relabeled (or marked not a cat), so it
+        # isn't trained under its old label too. Files are named <id>.jpg / <id>_<time>.jpg
+        current_labels = {row[0]: row[1] for row in rows}
+        for kind in ("current", "corrections"):
+            for filepath in TRAINING_DIR.glob(f"{kind}/*/*.jpg"):
+                stem = filepath.stem.split('_')[0]
+                if stem.isdigit() and int(stem) in current_labels and current_labels[int(stem)] != filepath.parent.name:
+                    filepath.unlink(missing_ok=True)
+
+        for row in rows:
             sighting_id, label, thumbnail = row
             if thumbnail and label in labels:
                 training_path = TRAINING_DIR / "current" / label
